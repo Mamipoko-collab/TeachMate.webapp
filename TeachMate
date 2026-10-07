@@ -1,0 +1,993 @@
+import csv
+import hashlib
+import os
+import random
+import re
+from datetime import datetime
+
+import firebase_admin
+import requests
+from firebase_admin import credentials
+from firebase_admin import db
+from flask import Flask, jsonify, request
+
+
+def load_env_file(path=".env"):
+    if not os.path.exists(path):
+        return
+
+    with open(path, encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_env_file()
+
+FIREBASE_CREDENTIALS_PATH = .env.example
+FIREBASE_DATABASE_URL = .env.example(
+    "FIREBASE_DATABASE_URL", "")
+if not FIREBASE_DATABASE_URL:
+    raise RuntimeError("FIREBASE_DATABASE_URL is not set")
+)
+OLLAMA_API_URL = .env.example
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "")
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", ""))
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", ""))
+API_KEY = .env.example
+SENTENCES_CSV_PATH = os.getenv("SENTENCES_CSV_PATH", "Sentences.csv")
+CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "")
+
+cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
+firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DATABASE_URL})
+
+app = Flask(__name__)
+app.json.sort_keys = False
+
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin")
+    allowed_origin = CORS_ALLOWED_ORIGINS
+
+    if allowed_origin != "*" and origin:
+        allowed_origins = [item.strip() for item in allowed_origin.split(",")]
+        if origin in allowed_origins:
+            allowed_origin = origin
+
+    response.headers["Access-Control-Allow-Origin"] = allowed_origin
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Authorization, Content-Type, X-API-Key, X-Requested-With"
+    )
+    response.headers["Access-Control-Max-Age"] = "86400"
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+
+
+@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def handle_options(path):
+    return "", 204
+
+
+def require_api_key():
+    if not API_KEY:
+        return None
+
+    provided_key = request.headers.get("X-API-Key")
+    authorization = request.headers.get("Authorization", "")
+
+    if not provided_key and authorization.startswith("Bearer "):
+        provided_key = authorization.replace("Bearer ", "", 1).strip()
+
+    if provided_key != API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    return None
+
+
+@app.route("/terms-of-service", methods=["GET"])
+@app.route("/terms", methods=["GET"])
+def get_terms_of_service():
+    return jsonify({
+        "status": "success",
+        "title": "Terms of Service",
+        "version": "1.0",
+        "last_updated": "2026-07-07",
+        "terms": [
+            {
+                "heading": "การยอมรับเงื่อนไข",
+                "content": "เมื่อใช้งานบริการนี้ ผู้ใช้ถือว่ายอมรับข้อกำหนดและเงื่อนไขทั้งหมด",
+            },
+            {
+                "heading": "วัตถุประสงค์ของบริการ",
+                "content": "บริการนี้ใช้เพื่อฝึกเขียนเรียงความภาษาอังกฤษ ตรวจสอบความถูกต้องในการเขียน ให้ข้อเสนอแนะเพื่อการเรียนรู้ และให้คะแนนตามเกณฑ์ TOEIC Writing",
+            },
+            {
+                "heading": "ความถูกต้องของผลลัพธ์",
+                "content": "ผลคะแนนและข้อเสนอแนะจากปัญญาประดิษฐ์(AI) เป็นคำแนะนำเพื่อการศึกษาเท่านั้น อาจมีข้อผิดพลาดได้ ผู้ใช้ควรใช้วิจารณญาณประกอบ",
+            },
+            {
+                "heading": "สิทธิและหน้าที่ของผู้ใช้",
+                "content": "1.ระบบจะจัดเก็บบัญชีอีเมล ชื่อ คำตอบ และคะแนนของผู้ใช้ เพื่อใช้แสดงประมวลผลคะแนน ประวัติการใช้งาน และอันดับคะแนน\n2.ข้อมูลส่วนบุคคลจะไม่ถูกเปิดเผยต่อสาธารณะ ยกเว้นชื่อที่ผู้ใช้ระบุไว้\n3.ผู้ใช้ควรหลีกเลี่ยงการส่งข้อมูลส่วนบุคคลที่ละเอียดอ่อน เช่น ข้อมูลทางการเงิน หรือข้อมูลส่วนตัวอื่นๆ\n4.ผู้ใช้ต้องรักษาความปลอดภัยของบัญชีและรหัสผ่าน หากพบการละเมิดความปลอดภัย ควรแจ้งผู้พัฒนาโดยทันที",
+            },
+            {
+                "heading": "การใช้งานที่เหมาะสม",
+                "content": "1.ผู้ใช้ต้องไม่ส่งข้อความที่ผิดกฎหมาย ละเมิดสิทธิผู้อื่น มีเนื้อหารุนแรง คุกคาม หรือไม่เหมาะสม\n2.ห้ามใช้บริการเพื่อวัตถุประสงค์ที่ผิดกฎหมาย หรือใช้ในเชิงพาณิชย์ก่อนได้รับอนุญาตจากผู้พัฒนา",
+            },
+            {
+                "heading": "การระงับหรือยกเลิกการให้บริการ",
+                "content": "ทางผู้พัฒนาขอสงวนสิทธิ์ในการระงับหรือยกเลิกการให้บริการแก่ผู้ใช้ที่ละเมิดข้อกำหนดและเงื่อนไขนี้",
+            },
+            {
+                "heading": "ความรับผิดชอบของผู้พัฒนา",
+                "content": "ผู้พัฒนาจะไม่รับผิดชอบต่อความเสียหาย ที่เกิดขึ้นจากการใช้งานบริการ ไม่ว่าจะเป็นทางตรงหรือทางอ้อมที่เกิดจากการใช้งานของระบบหรือผลลัพธ์จากปัญญาประดิษฐ์",
+            },
+            {
+                "heading": "การเปลี่ยนแปลงบริการ",
+                "content": "ผู้พัฒนาอาจปรับปรุง หรือแก้ไขได้ตามความเหมาะสม การใช้งานต่อหลังจากมีการเปลี่ยนแปลงถือว่าผู้ใช้งานยอมรับเงื่อนไขใหม่",
+            },
+        ],
+    })
+
+
+@app.route("/register", methods=["POST"])
+def register_user():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid JSON payload"}), 400
+
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Missing required parameter: name"}), 400
+
+    if len(name) > 50:
+        return jsonify({"error": "Name must be 50 characters or fewer"}), 400
+
+    normalized_name = normalize_name(name)
+    name_key = make_name_key(normalized_name)
+    name_index_ref = db.reference(f"user_name_index/{name_key}")
+
+    if name_index_ref.get():
+        return jsonify({
+            "status": "error",
+            "message": "This name is already registered",
+        }), 409
+
+    created_at = datetime.utcnow().isoformat()
+    user_ref = db.reference("users").push({
+        "name": name,
+        "normalized_name": normalized_name,
+        "created_at": created_at,
+    })
+
+    user_id = user_ref.key
+    name_index_ref.set({
+        "user_id": user_id,
+        "name": name,
+        "created_at": created_at,
+    })
+
+    return jsonify({
+        "status": "success",
+        "message": "User registered successfully",
+        "user": {
+            "id": user_id,
+            "name": name,
+            "created_at": created_at,
+        },
+    }), 201
+
+
+@app.route("/scores", methods=["GET"])
+def get_scores():
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
+    data = db.reference("essay_scores").get()
+
+    return jsonify({
+        "status": "success",
+        "data": data,
+    })
+
+
+@app.route("/leaderboard/top10", methods=["GET"])
+def get_top10_leaderboard():
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
+    scores = db.reference("essay_scores").get()
+    users = {}
+
+    if scores:
+        for record in scores.values():
+            name = (record.get("name") or "").strip()
+            if not name:
+                continue
+
+            score = score_to_number(record.get("score", record.get("grade")))
+            if score == "error":
+                continue
+
+            if name not in users:
+                users[name] = {
+                    "name": name,
+                    "total_score": 0,
+                    "scored_submissions": 0,
+                    "score_distribution": {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0},
+                }
+
+            users[name]["total_score"] += int(score)
+            users[name]["scored_submissions"] += 1
+            users[name]["score_distribution"][score] += 1
+
+    leaderboard = sorted(
+        users.values(),
+        key=lambda user: (
+            -user["total_score"],
+            -user["scored_submissions"],
+            user["name"].lower(),
+        ),
+    )[:10]
+
+    leaderboard = [
+        {
+            "rank": index,
+            "name": user["name"],
+            "total_score": user["total_score"],
+        }
+        for index, user in enumerate(leaderboard, start=1)
+    ]
+
+    return jsonify({
+        "status": "success",
+        "count": len(leaderboard),
+        "leaderboard": leaderboard,
+    })
+
+
+@app.route("/dashboard/overview", methods=["GET"])
+def get_dashboard_overview():
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
+    records = get_scored_records()
+    user_names = {record["name"] for record in records if record["name"]}
+    scores = [record["score"] for record in records]
+
+    summary = {
+        "total_users": len(user_names),
+        "total_submissions": len(records),
+        "total_score": sum(scores) if scores else 0,
+        "average_score": round(sum(scores) / len(scores), 2) if scores else None,
+        "highest_score": max(scores) if scores else None,
+        "lowest_score": min(scores) if scores else None,
+    }
+
+    return jsonify({
+        "status": "success",
+        "summary": summary,
+    })
+
+
+@app.route("/dashboard/leaderboard", methods=["GET"])
+def get_dashboard_leaderboard():
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
+    users = build_user_score_summary(get_scored_records())
+    leaderboard = build_leaderboard(users, limit=10)
+
+    return jsonify({
+        "status": "success",
+        "count": len(leaderboard),
+        "leaderboard": leaderboard,
+    })
+
+
+@app.route("/dashboard/score-trend", methods=["GET"])
+def get_dashboard_score_trend():
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
+    trend_by_date = {}
+
+    for record in get_scored_records():
+        created_at = record["created_at"]
+        if not created_at:
+            continue
+
+        date = created_at[:10]
+        if date not in trend_by_date:
+            trend_by_date[date] = {
+                "date": date,
+                "total_submissions": 0,
+                "total_score": 0,
+            }
+
+        trend_by_date[date]["total_submissions"] += 1
+        trend_by_date[date]["total_score"] += record["score"]
+
+    trend = [trend_by_date[date] for date in sorted(trend_by_date)]
+
+    return jsonify({
+        "status": "success",
+        "trend": trend,
+    })
+
+
+@app.route("/scores/<name>", methods=["GET"])
+def get_scores_by_name(name):
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
+    scores = db.reference("essay_scores").get()
+    records = []
+    numeric_scores = []
+    score_distribution = {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0}
+
+    if scores:
+        for record_id, record in scores.items():
+            if record.get("name") != name:
+                continue
+
+            raw_score = record.get("score", record.get("grade"))
+            score = score_to_number(raw_score)
+            record_data = {
+                "id": record_id,
+                "name": record.get("name"),
+                "score": score,
+                "raw_score": raw_score,
+                "essay": record.get("essay"),
+                "feedback": record.get("feedback"),
+                "created_at": record.get("created_at"),
+            }
+            records.append(record_data)
+
+            if score != "error":
+                numeric_scores.append(int(score))
+                score_distribution[score] += 1
+
+    total_score = None
+    min_score = None
+    max_score = None
+    if numeric_scores:
+        total_score = sum(numeric_scores)
+        min_score = min(numeric_scores)
+        max_score = max(numeric_scores)
+
+    response_data = {
+        "status": "success",
+        "name": name,
+        "summary": {
+            "total_submissions": len(records),
+            "scored_submissions": len(numeric_scores),
+            "total_score": total_score,
+            "min_score": min_score,
+            "max_score": max_score,
+            "score_distribution": score_distribution,
+        },
+    }
+
+    include_records = request.args.get("include_records", "false").lower() == "true"
+    if include_records:
+        response_data["data"] = records
+
+    return jsonify(response_data)
+
+
+@app.route("/sentences/random-thai", methods=["GET"])
+def get_random_thai_sentence():
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
+    try:
+        sentence = random.choice(load_thai_sentences())
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": "Sentences.csv not found"}), 500
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    return jsonify({
+        "status": "success",
+        "thai_sentence": sentence["thai_sentence"],
+        "data": sentence,
+    })
+
+
+@app.route("/eval", methods=["POST"])
+def create_user():
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid JSON payload"}), 400
+
+    name = data.get("name")
+    text_message = data.get("text_message")
+
+    if not isinstance(name, str) or not name.strip():
+        return jsonify({"error": "Missing required parameters: name"}), 400
+
+    if not isinstance(text_message, str) or not text_message.strip():
+        return jsonify({"error": "No message provided"}), 400
+
+    name = name.strip()
+    text_message = text_message.strip()
+    en_message, th_message = parse_bilingual_message(text_message)
+    if not en_message:
+        return jsonify({"error": "English essay is required"}), 400
+
+    prompt = build_prompt(en_message, th_message)
+    ollama_payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": OLLAMA_TEMPERATURE,
+        },
+    }
+
+    try:
+        response = requests.post(
+            OLLAMA_API_URL,
+            json=ollama_payload,
+            timeout=OLLAMA_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        response_data = response.json()
+        ai_response = response_data.get("response") or ""
+        app.logger.warning("Ollama first raw response: %r", ai_response)
+        first_validation_errors = get_feedback_validation_errors(
+            ai_response,
+            en_message,
+            text_message,
+        )
+        if first_validation_errors:
+            app.logger.warning(
+                "Ollama first response validation errors: %s",
+                ", ".join(first_validation_errors),
+            )
+
+        if should_retry_ai_feedback(ai_response, en_message, text_message):
+            if extract_score(ai_response) == "error":
+                app.logger.warning("Ollama feedback was missing a valid score; retrying")
+
+            retry_payload = {
+                **ollama_payload,
+                "prompt": build_retry_prompt(en_message, th_message),
+            }
+            response = requests.post(
+                OLLAMA_API_URL,
+                json=retry_payload,
+                timeout=OLLAMA_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            response_data = response.json()
+            ai_response = response_data.get("response") or ""
+            app.logger.warning("Ollama retry raw response: %r", ai_response)
+            retry_validation_errors = get_feedback_validation_errors(
+                ai_response,
+                en_message,
+                text_message,
+            )
+            if retry_validation_errors:
+                app.logger.warning(
+                    "Ollama retry response validation errors: %s",
+                    ", ".join(retry_validation_errors),
+                )
+
+        if should_reject_ai_feedback(ai_response, en_message, text_message):
+            return jsonify({
+                "status": "error",
+                "message": "AI returned invalid or low-quality feedback. Please try again.",
+            }), 502
+
+        score = extract_score(ai_response)
+        if score == "error":
+            app.logger.warning("Ollama retry feedback was missing a valid score")
+            return jsonify({
+                "status": "error",
+                "message": "AI returned feedback without a valid score. Please try again.",
+            }), 502
+
+        ai_response = normalize_feedback(ai_response, score)
+
+        db.reference("essay_scores").push({
+            "name": name,
+            "score": score,
+            "essay": text_message,
+            "feedback": ai_response,
+            "created_at": datetime.utcnow().isoformat(),
+        })
+
+        return jsonify({
+            "status": "success",
+            "reply": ai_response,
+            "score": score,
+        }), 200
+
+    except requests.Timeout:
+        return jsonify({"status": "error", "message": "Ollama request timed out"}), 504
+    except requests.RequestException as e:
+        return jsonify({"status": "error", "message": f"Ollama request failed: {e}"}), 502
+    except ValueError:
+        return jsonify({"status": "error", "message": "Ollama returned invalid JSON"}), 502
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def build_prompt(en_message, th_message=None):
+    return f"""You are a professional English writing teacher, and you must provide feedback on the English essay below. 
+Evaluation rules:
+
+Role:Your task is to evaluate the English essay based on the Thai intended meaning provided. You will provide feedback in Thai, focusing on the following points:
+1. เทียบว่า English essay สื่อความหมายตรงและครบตามที่ Thai reference ตั้งใจไว้หรือไม่
+2. ชี้จุดผิดในภาษาอังกฤษแบบเจาะจง (คำ/วลีที่มีปัญหา) พร้อมอธิบายกฎไวยากรณ์ที่เกี่ยวข้อง และให้คำใบ้เป็นภาษาไทยที่เข้าใจง่าย
+3. ถ้าเป็นคำสะกดผิด ให้บอกว่าคำไหนสะกดผิด และแนะนำให้เช็คจุดไหน แต่ห้ามบอกคำที่สะกดถูก
+4. ห้ามให้คำตอบสำเร็จรูป — ห้ามแก้คำ แก้วลี เขียนประโยคใหม่ หรือให้ model answer ผู้เรียนต้องแก้เอง
+5. ห้ามหาเรื่องผิดในประโยคภาษาไทย และห้ามแนะนำให้แก้ถ้อยคำภาษาไทย
+
+รูปแบบการเขียน: อธิบายทุกอย่างเป็นภาษาไทยที่เข้าใจง่าย ส่วนคำ/วลีภาษาอังกฤษที่ยกมาให้คงเป็นภาษาอังกฤษ ห้ามแปล
+
+ส่วนที่ 4 — แนะนำคำศัพท์ใหม่:
+- เสนอคำ/วลี/คำพ้องความหมาย 2-4 คำที่เกี่ยวข้องกับไอเดียใน English essay คั่นด้วยจุลภาค
+- แต่ละคำต้องเป็นคำพ้องหรือความหมายใกล้เคียงกับคำที่ "มีอยู่แล้ว" ใน essay
+- ห้ามซ้ำกับคำที่ปรากฏใน essay แม้จะเขียนตัวพิมพ์เล็ก-ใหญ่ต่างกัน
+- เขียนคำศัพท์เป็นภาษาอังกฤษ ตามด้วยคำอธิบายสั้นๆ เป็นภาษาไทยได้ (วิธีใช้)
+English essay:
+{en_message}
+
+Thai meaning reference:
+{th_message or ""}
+
+Score guide:
+1 = very hard to understand or meaning is mostly wrong
+2 = partly understandable but many errors, short or incomplete
+3 = understandable but has clear errors or unnatural wording
+4 = good, mostly correct, small improvements possible
+5 = clear, correct, natural, and meaning matches
+
+Write one result only. Do not repeat these instructions and do not print placeholder text.
+The first line must contain the Thai word for score, a colon, and the chosen digit.
+Use these exact headings and write real feedback after each colon:
+ข้อเสนอแนะ:
+1. ความสอดคล้องของความหมาย:
+2. จุดที่ควรตรวจสอบ:
+3. ไวยากรณ์และการเลือกใช้คำ:
+4. คำศัพท์หรือวลีภาษาอังกฤษที่แนะนำ:
+5. แนวทางพัฒนา:
+"""
+
+
+def build_retry_prompt(en_message, th_message=None):
+    return f"""You are a professional English writing teacher.
+CRITICAL:
+- Check the ENGLISH ESSAY only.
+- THAI INTENDED MEANING is not an essay. Use it only to understand what the writer wanted to say.
+- Never correct or recommend changes to THAI INTENDED MEANING.
+- Explain the feedback in Thai, while leaving quoted text from the essay in English.
+- Section 2 must quote each problematic English word or phrase and explain what the learner should check, but must not provide its corrected form.
+- Pay special attention to spelling, typographical errors and grammar.
+- Never supply a corrected word, corrected phrase, rewritten sentence, or complete model answer.
+- Section 4 items must be new synonyms for words or ideas in ENGLISH ESSAY and must not already occur in it.
+
+ENGLISH ESSAY:
+{en_message}
+
+THAI INTENDED MEANING (reference only; never quote it):
+{th_message or ""}
+
+Requirements:
+- The first line must be `คะแนน:` followed by one real digit from 1 to 5. Never return `<1-5>`.
+- Evaluate only the English essay. Use the Thai reference only as the writer's intended meaning.
+- Never analyze, correct, quote, or recommend words from the Thai reference.
+- Explain all advice in clear Thai. Keep quoted English essay text in English.
+- Section 4 must contain 2-4 new English words or phrases with short Thai usage explanations.
+- Section 5 must guide the learner to revise independently and must not reveal a completed correction.
+
+Do not copy instructions, descriptions in brackets, or placeholder text. Return one result only.
+The first line must contain the Thai word for score, a colon, and the chosen digit.
+ข้อเสนอแนะ:
+1. ความสอดคล้องของความหมาย:
+2. จุดที่ควรตรวจสอบ:
+3. ไวยากรณ์และการเลือกใช้คำ:
+4. คำศัพท์หรือวลีภาษาอังกฤษที่แนะนำ:
+5. แนวทางพัฒนา:
+"""
+
+def clean_language_label(text):
+    return re.sub(r"^\s*(?:EN|TH)\s*:\s*", "", text, flags=re.IGNORECASE).strip()
+
+
+def parse_bilingual_message(text):
+    """Split labelled EN/TH blocks while preserving multi-line English essays."""
+    english_lines = []
+    thai_lines = []
+    current_language = None
+    found_label = False
+
+    for line in text.splitlines():
+        label_match = re.match(r"^\s*(EN|TH)\s*:\s*(.*)$", line, re.IGNORECASE)
+        if label_match:
+            found_label = True
+            current_language = label_match.group(1).lower()
+            content = label_match.group(2).strip()
+            if content:
+                (english_lines if current_language == "en" else thai_lines).append(content)
+            continue
+
+        if current_language == "th":
+            thai_lines.append(line.strip())
+        else:
+            english_lines.append(line.strip())
+
+    if not found_label:
+        lines = text.splitlines()
+        english_lines = [lines[0].strip()] if lines else []
+        thai_lines = [line.strip() for line in lines[1:]]
+
+    english = "\n".join(line for line in english_lines if line).strip()
+    thai = "\n".join(line for line in thai_lines if line).strip()
+    return english, thai
+
+
+
+def contains_template_artifacts(text):
+    artifacts = (
+        "ตอบเป็นภาษาไทย",
+        "English text",
+        "Thai reference",
+        "วิเคราะห์ grammar",
+        "No explanations",
+        "เขียนผลการตรวจ",
+        "เขียนคำแนะนำ",
+        "1 หรือ 2 หรือ 3 หรือ 4 หรือ 5",
+        "<คำอธิบาย",
+        "<quoted English",
+        "<English",
+        "<คำแนะนำ",
+        "followed by one digit",
+    )
+    if any(artifact.lower() in text.lower() for artifact in artifacts):
+        return True
+
+    return bool(re.search(r"<[^>]+>", text))
+
+
+def has_sentence_specific_references(text, en_message):
+    stop_words = {
+        "about", "after", "again", "below", "could", "every", "first", "from",
+        "general", "have", "into", "only", "order", "other", "sentence",
+        "should", "their", "there", "these", "thing", "those", "while",
+        "would", "write", "writing",
+    }
+    terms = []
+    for word in re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", en_message.lower()):
+        if len(word) < 3 or word in stop_words:
+            continue
+        if word not in terms:
+            terms.append(word)
+
+    if not terms:
+        return True
+
+    text_lower = text.lower()
+    matched_terms = [term for term in terms if term in text_lower]
+    return len(matched_terms) >= 1
+
+
+def is_low_quality_feedback(text, en_message=""):
+    generic_phrases = (
+        "ความหมายตรงกัน",
+        "ไวยากรณ์ธรรมชาติ",
+        "คำศัพท์ที่เหมาะสม",
+        "ปรับปรุงให้ดีขึ้นได้",
+    )
+    has_specific_references = has_sentence_specific_references(text, en_message)
+    if any(phrase in text for phrase in generic_phrases) and not has_specific_references:
+        return True
+
+    sections = extract_feedback_sections(text)
+    required_sections = ("1", "2", "3", "4", "5")
+    if any(section not in sections for section in required_sections):
+        return True
+
+    for section in ("1", "2", "3", "5"):
+        if len(sections[section].strip()) < 10:
+            return True
+
+    content_sections = " ".join(sections[section] for section in ("1", "2", "3", "5"))
+    if en_message and not has_sentence_specific_references(content_sections, en_message):
+        return True
+
+    vocabulary_section = sections["4"].strip()
+    return has_invalid_vocabulary_section(vocabulary_section, en_message)
+
+
+def has_invalid_vocabulary_section(vocabulary_section, en_message=""):
+    english_items = re.findall(
+        r"(?:^|,)\s*([A-Za-z][A-Za-z' ]*?)\s+[—–-]\s+",
+        vocabulary_section,
+    )
+    if not english_items:
+        english_items = [
+            item.strip()
+            for item in vocabulary_section.split(",")
+            if re.fullmatch(r"[A-Za-z][A-Za-z' ]*", item.strip())
+        ]
+
+    if not (2 <= len(english_items) <= 4):
+        return True
+
+    used_words = {
+        word.lower()
+        for word in re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", en_message)
+    }
+    for item in english_items:
+        item_words = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", item)
+        if not item_words:
+            return True
+        if all(word.lower() in used_words for word in item_words):
+            return True
+
+    return False
+
+
+def is_echo_response(text, en_message="", text_message=""):
+    normalized_text = " ".join((text or "").split()).lower()
+    normalized_input = " ".join((text_message or "").split()).lower()
+    normalized_english = " ".join((en_message or "").split()).lower()
+
+    if not normalized_text:
+        return True
+
+    if normalized_input and normalized_text == normalized_input:
+        return True
+
+    if normalized_english and normalized_text == normalized_english:
+        return True
+
+    if '"name"' in normalized_text and '"text_message"' in normalized_text:
+        return True
+
+    if normalized_english and len(normalized_english) > 80 and normalized_english in normalized_text:
+        return True
+
+    return False
+
+
+def should_retry_ai_feedback(text, en_message="", text_message=""):
+    return (
+        is_echo_response(text, en_message, text_message)
+        or contains_template_artifacts(text)
+        or is_low_quality_feedback(text, en_message)
+        or extract_score(text) == "error"
+    )
+
+
+def get_feedback_validation_errors(text, en_message="", text_message=""):
+    errors = []
+    if is_echo_response(text, en_message, text_message):
+        errors.append("empty response, echoed input, or echoed request JSON")
+    if contains_template_artifacts(text):
+        errors.append("contains prompt/template placeholders")
+    if is_low_quality_feedback(text, en_message):
+        errors.append("missing, too short, non-specific, or invalid feedback sections")
+    if extract_score(text) == "error":
+        errors.append("missing valid score from 1 to 5")
+
+    score_count = len(re.findall(r"คะแนน\s*:\s*[1-5]\b", text or ""))
+    if score_count > 1:
+        errors.append(f"duplicate Thai score labels ({score_count})")
+
+    return errors
+
+
+def should_reject_ai_feedback(text, en_message="", text_message=""):
+    return (
+        is_echo_response(text, en_message, text_message)
+        or contains_template_artifacts(text)
+        or is_low_quality_feedback(text, en_message)
+        or len(re.findall(r"คะแนน\s*:\s*[1-5]\b", text)) != 1
+    )
+
+
+def extract_feedback_sections(text):
+    sections = {}
+    matches = list(re.finditer(r"(?m)^\s*([1-5])\.\s*([^:]*):\s*", text))
+    for index, match in enumerate(matches):
+        section_number = match.group(1)
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        sections[section_number] = text[start:end].strip()
+
+    return sections
+
+
+def load_thai_sentences():
+    sentences = []
+
+    with open(SENTENCES_CSV_PATH, newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        for row in reader:
+            thai_sentence = (row.get("Thai Translation") or "").strip()
+            if not thai_sentence:
+                continue
+
+            sentences.append({
+                "no": row.get("No"),
+                "category": row.get("Category"),
+                "english_sentence": row.get("English Sentence"),
+                "thai_sentence": thai_sentence,
+            })
+
+    if not sentences:
+        raise ValueError("No Thai sentences found in Sentences.csv")
+
+    return sentences
+
+
+def get_scored_records():
+    records = []
+    scores = db.reference("essay_scores").get()
+
+    if not scores:
+        return records
+
+    for record_id, record in scores.items():
+        score = score_to_number(record.get("score", record.get("grade")))
+        if score == "error":
+            continue
+
+        records.append({
+            "id": record_id,
+            "name": (record.get("name") or "").strip(),
+            "score": int(score),
+            "raw_score": record.get("score", record.get("grade")),
+            "essay": record.get("essay"),
+            "feedback": record.get("feedback"),
+            "created_at": record.get("created_at"),
+        })
+
+    return records
+
+
+def build_user_score_summary(records):
+    users = {}
+
+    for record in records:
+        name = record["name"]
+        if not name:
+            continue
+
+        if name not in users:
+            users[name] = {
+                "name": name,
+                "total_score": 0,
+                "scored_submissions": 0,
+            }
+
+        users[name]["total_score"] += record["score"]
+        users[name]["scored_submissions"] += 1
+
+    return users
+
+
+def build_leaderboard(users, limit=10):
+    sorted_users = sorted(
+        users.values(),
+        key=lambda user: (
+            -user["total_score"],
+            -user["scored_submissions"],
+            user["name"].lower(),
+        ),
+    )[:limit]
+
+    return [
+        {
+            "rank": index,
+            "name": user["name"],
+            "total_score": user["total_score"],
+        }
+        for index, user in enumerate(sorted_users, start=1)
+    ]
+
+
+def normalize_name(name):
+    return " ".join(name.strip().casefold().split())
+
+
+def make_name_key(normalized_name):
+    return hashlib.sha256(normalized_name.encode("utf-8")).hexdigest()
+
+
+def extract_score(text):
+    score_match = re.search(r"คะแนน\s*:\s*([1-5])\b", text, re.IGNORECASE)
+    if score_match:
+        return score_match.group(1)
+
+    score_label_match = re.search(
+        r"(?:score|rating|ระดับ|คะแนน)\s*:?\s*\**([1-5])\**\b",
+        text,
+        re.IGNORECASE,
+    )
+    if score_label_match:
+        return score_label_match.group(1)
+
+    grade_match = re.search(
+        r"(?:Grade|เกรด)\s*:?\s*\**([ABCDF])\**\b",
+        text,
+        re.IGNORECASE,
+    )
+    if grade_match:
+        return grade_to_score(grade_match.group(1))
+
+    return "error"
+
+
+def extract_grade(text):
+    return extract_score(text)
+
+
+def score_to_number(score):
+    if score is None:
+        return "error"
+
+    score_text = str(score).strip().upper()
+    if re.fullmatch(r"[1-5]", score_text):
+        return score_text
+
+    if re.fullmatch(r"[ABCDF]", score_text):
+        return grade_to_score(score_text)
+
+    extracted_score = extract_score(score_text)
+    if extracted_score != "error":
+        return extracted_score
+
+    return "error"
+
+
+def grade_to_score(grade):
+    grade_scores = {
+        "A": "5",
+        "B": "4",
+        "C": "3",
+        "D": "2",
+        "F": "1",
+    }
+    return grade_scores.get(grade.upper(), "error")
+
+
+def normalize_feedback(text, score):
+    if re.search(r"^\s*คะแนน\s*:\s*[1-5]\b", text, re.IGNORECASE):
+        return text
+
+    cleaned_text = re.sub(
+        r"^\s*\**(?:Grade|เกรด)\s*:?\s*[ABCDF]\**\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    cleaned_text = re.sub(r"^\s*\**Feedback:\**\s*", "", cleaned_text, flags=re.IGNORECASE)
+    return f"คะแนน: {score}\nข้อเสนอแนะ: {cleaned_text.strip()}"
+
+
+if __name__ == "__main__":
+    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host="0.0.0.0", port=5000, debug=debug)
